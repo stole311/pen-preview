@@ -25,7 +25,7 @@
 <body>
 <div class="pp" id="pen-preview">
   <h2>So sieht Ihr Kugelschreiber aus</h2>
-  <p class="hint">Logo hochladen (PNG, JPG, SVG), mit Maus oder Finger verschieben und Größe anpassen.</p>
+  <p class="hint">Logo hochladen (PNG, JPG, SVG), mit Maus oder Finger verschieben und Größe anpassen. Mit "Stift drehen" sehen Sie das Logo rundherum.</p>
 
   <div class="stage"><canvas id="pp-canvas" width="800" height="739"></canvas></div>
 
@@ -37,7 +37,8 @@
 
   <div class="controls">
     <label>Größe <input type="range" id="pp-size" min="20" max="400" value="150"></label>
-    <label>Drehung <input type="range" id="pp-rot" min="-180" max="180" value="0"></label>
+    <label>Stift drehen <input type="range" id="pp-phi" min="-180" max="180" value="0"></label>
+    <label>Logo drehen <input type="range" id="pp-rot" min="-180" max="180" value="0"></label>
     <label>Darstellung
       <select id="pp-mode">
         <option value="multiply">Aufdruck (dunkle Logos)</option>
@@ -53,20 +54,29 @@
   const $ = id => document.getElementById(id);
   const canvas = $('pp-canvas'), ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height;
+  const DEG = Math.PI / 180, S = 2; // S = Oversampling des Logos
 
   // Stiftachse (Pixel im Bild): Spitze -> Ende
   const AX = { x0: 15, y0: 720, x1: 760, y1: 50 };
   const len = Math.hypot(AX.x1 - AX.x0, AX.y1 - AX.y0);
   const dx = (AX.x1 - AX.x0) / len, dy = (AX.y1 - AX.y0) / len;
-  const axisAngle = Math.atan2(dy, dx);
   // Bedruckbarer Bereich entlang der Achse (Holzschaft zwischen Metallspitze und Clip)
   const U_MIN = 165, U_MAX = 650;
+  const uOf = (x, y) => (x - AX.x0) * dx + (y - AX.y0) * dy;   // Position entlang der Achse
+  const vOf = (x, y) => -(x - AX.x0) * dy + (y - AX.y0) * dx;  // Abstand quer zur Achse
 
-  const state = { x: 300, y: 455, size: 150, rot: 0, alpha: 0.9, mode: 'multiply', logo: null };
+  const state = {
+    u0: uOf(300, 455), psi0: 0,      // Logo-Mitte: Achsposition / Winkel auf dem Zylinder
+    size: 150, rot: 0, phi: 0,       // Größe, Logo-Drehung (Grad), Stiftdrehung (Grad)
+    alpha: 0.9, mode: 'multiply', logo: null
+  };
   const def = Object.assign({}, state);
 
   const pen = new Image();
-  let mask = null;
+  let pix = null;          // {n, u, v, a}: Holzpixel des Schafts
+  let cen, rad;            // Mittellinie und Radius des Schafts pro Achsposition
+  let layerCanvas, layerData;
+  let raster = null;       // gecachte Logo-Pixel
 
   function makeDemoLogo() {
     const c = document.createElement('canvas'); c.width = 400; c.height = 140;
@@ -81,47 +91,94 @@
     const tmp = document.createElement('canvas'); tmp.width = W; tmp.height = H;
     const g = tmp.getContext('2d'); g.drawImage(pen, 0, 0, W, H);
     const d = g.getImageData(0, 0, W, H), p = d.data;
+    const N = Math.ceil(len) + 2;
+    const vmin = new Float32Array(N).fill(1e9), vmax = new Float32Array(N).fill(-1e9);
     for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
       const i = (y * W + x) * 4;
       const r = p[i], b = p[i + 2];
-      const u = (x - AX.x0) * dx + (y - AX.y0) * dy;
+      const u = uOf(x, y);
       const wood = (r - b) > 35 && r > 110 && u > U_MIN && u < U_MAX;
+      if (wood) {
+        const ui = Math.round(u), v = vOf(x, y);
+        if (v < vmin[ui]) vmin[ui] = v;
+        if (v > vmax[ui]) vmax[ui] = v;
+      }
       p[i] = p[i + 1] = p[i + 2] = 0; p[i + 3] = wood ? 255 : 0;
     }
     g.putImageData(d, 0, 0);
-    // Kanten leicht weichzeichnen und einziehen
+
+    // Mittellinie/Radius pro Achsposition, geglättet
+    const c0 = new Float32Array(N), r0 = new Float32Array(N);
+    let lastC = 0, lastR = 30;
+    for (let i = 0; i < N; i++) {
+      if (vmax[i] > vmin[i]) { lastC = (vmin[i] + vmax[i]) / 2; lastR = (vmax[i] - vmin[i]) / 2 + 0.5; }
+      c0[i] = lastC; r0[i] = lastR;
+    }
+    cen = new Float32Array(N); rad = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      let sc = 0, sr = 0, k = 0;
+      for (let j = Math.max(0, i - 8); j <= Math.min(N - 1, i + 8); j++) { sc += c0[j]; sr += r0[j]; k++; }
+      cen[i] = sc / k; rad[i] = sr / k;
+    }
+
+    // Weiche Kanten
     const m = document.createElement('canvas'); m.width = W; m.height = H;
     const mg = m.getContext('2d'); mg.filter = 'blur(1.5px)'; mg.drawImage(tmp, 0, 0);
-    mask = m;
+    const md = mg.getImageData(0, 0, W, H).data;
+    const us = [], vs = [], as = [], idx = [];
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const a = md[(y * W + x) * 4 + 3];
+      if (a > 8) { us.push(uOf(x, y)); vs.push(vOf(x, y)); as.push(a); idx.push(y * W + x); }
+    }
+    pix = { n: us.length, u: Float32Array.from(us), v: Float32Array.from(vs), a: Uint8Array.from(as), idx: Int32Array.from(idx) };
+
+    layerCanvas = document.createElement('canvas'); layerCanvas.width = W; layerCanvas.height = H;
+    layerData = layerCanvas.getContext('2d').createImageData(W, H);
   }
+
+  function getRaster() {
+    const logo = state.logo;
+    if (raster && raster.logo === logo && raster.size === state.size) return raster;
+    const lw = state.size, lh = state.size * logo.naturalHeight / logo.naturalWidth;
+    const w = Math.max(1, Math.round(lw * S)), h = Math.max(1, Math.round(lh * S));
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const g = c.getContext('2d'); g.drawImage(logo, 0, 0, w, h);
+    raster = { logo, size: state.size, w, h, lw, lh, data: g.getImageData(0, 0, w, h).data };
+    return raster;
+  }
+
+  const clampU = u => Math.min(U_MAX, Math.max(U_MIN, Math.round(u)));
+  const TWO_PI = Math.PI * 2;
 
   function render() {
     ctx.clearRect(0, 0, W, H);
     ctx.drawImage(pen, 0, 0, W, H);
-    if (!state.logo || !mask) return;
-    const layer = document.createElement('canvas'); layer.width = W; layer.height = H;
-    const g = layer.getContext('2d');
-    const lw = state.size, lh = state.size * state.logo.naturalHeight / state.logo.naturalWidth;
-    g.translate(state.x, state.y);
-    g.rotate(axisAngle + state.rot * Math.PI / 180);
-    g.drawImage(state.logo, -lw / 2, -lh / 2, lw, lh);
-    g.setTransform(1, 0, 0, 1, 0, 0);
-    g.globalCompositeOperation = 'destination-in';
-    g.drawImage(mask, 0, 0);
+    if (!state.logo || !pix) return;
+    const R = getRaster();
+    const out = layerData.data; out.fill(0);
+    const rot = state.rot * DEG, phi = state.phi * DEG;
+    const ca = Math.cos(rot), sa = Math.sin(rot);
+
+    for (let k = 0; k < pix.n; k++) {
+      const u = pix.u[k], ui = clampU(u);
+      let t = (pix.v[k] - cen[ui]) / rad[ui];
+      t = t > 0.999 ? 0.999 : t < -0.999 ? -0.999 : t;
+      let dlt = Math.asin(t) + phi - state.psi0;        // Winkel zur Logo-Mitte auf dem Zylinder
+      dlt -= TWO_PI * Math.round(dlt / TWO_PI);
+      const a = u - state.u0, b = rad[ui] * dlt;        // abgerollte Koordinaten (Achse / Umfang)
+      const lx = a * ca + b * sa, ly = -a * sa + b * ca;
+      const ix = Math.floor((lx + R.lw / 2) * S), iy = Math.floor((ly + R.lh / 2) * S);
+      if (ix < 0 || iy < 0 || ix >= R.w || iy >= R.h) continue;
+      const si = (iy * R.w + ix) * 4, oi = pix.idx[k] * 4;
+      out[oi] = R.data[si]; out[oi + 1] = R.data[si + 1]; out[oi + 2] = R.data[si + 2];
+      out[oi + 3] = R.data[si + 3] * pix.a[k] / 255;
+    }
+    layerCanvas.getContext('2d').putImageData(layerData, 0, 0);
     ctx.save();
     ctx.globalAlpha = state.alpha;
     ctx.globalCompositeOperation = state.mode;
-    ctx.drawImage(layer, 0, 0);
+    ctx.drawImage(layerCanvas, 0, 0);
     ctx.restore();
-  }
-
-  function setLogo(src) {
-    const img = new Image();
-    img.onload = () => {
-      if (!img.naturalWidth) return;
-      state.logo = img; render();
-    };
-    img.src = src;
   }
 
   // Eingaben
@@ -135,10 +192,11 @@
   });
   $('pp-size').addEventListener('input', e => { state.size = +e.target.value; render(); });
   $('pp-rot').addEventListener('input', e => { state.rot = +e.target.value; render(); });
+  $('pp-phi').addEventListener('input', e => { state.phi = +e.target.value; render(); });
   $('pp-mode').addEventListener('change', e => { state.mode = e.target.value; render(); });
   $('pp-reset').addEventListener('click', () => {
     Object.assign(state, def, { logo: state.logo });
-    $('pp-size').value = def.size; $('pp-rot').value = 0; $('pp-mode').value = def.mode;
+    $('pp-size').value = def.size; $('pp-rot').value = 0; $('pp-phi').value = 0; $('pp-mode').value = def.mode;
     render();
   });
   $('pp-download').addEventListener('click', () => {
@@ -146,25 +204,36 @@
     a.href = canvas.toDataURL('image/png'); a.click();
   });
 
-  // Verschieben per Maus/Touch
+  // Verschieben per Maus/Touch (auf der Zylinderoberfläche)
   let drag = null;
-  function pos(e) {
+  function surf(e) {
     const r = canvas.getBoundingClientRect();
-    return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
+    const x = (e.clientX - r.left) * W / r.width, y = (e.clientY - r.top) * H / r.height;
+    const u = uOf(x, y), ui = clampU(u);
+    let t = (vOf(x, y) - cen[ui]) / rad[ui];
+    t = Math.max(-0.98, Math.min(0.98, t));
+    return { u, th: Math.asin(t) };
   }
   canvas.addEventListener('pointerdown', e => {
-    const p = pos(e); drag = { dx: state.x - p.x, dy: state.y - p.y };
+    if (!pix) return;
+    const s = surf(e); drag = { u: s.u, th: s.th, u0: state.u0, psi0: state.psi0 };
     canvas.setPointerCapture(e.pointerId); canvas.classList.add('drag');
   });
   canvas.addEventListener('pointermove', e => {
-    if (!drag) return; const p = pos(e);
-    state.x = p.x + drag.dx; state.y = p.y + drag.dy; render();
+    if (!drag) return; const s = surf(e);
+    state.u0 = Math.min(U_MAX, Math.max(U_MIN, drag.u0 + s.u - drag.u));
+    state.psi0 = drag.psi0 + (s.th - drag.th);
+    render();
   });
   const end = () => { drag = null; canvas.classList.remove('drag'); };
   canvas.addEventListener('pointerup', end);
   canvas.addEventListener('pointercancel', end);
 
-  pen.onload = () => { buildMask(); state.logo = makeDemoLogo(); state.logo.onload = render; render(); };
+  pen.onload = () => {
+    buildMask();
+    state.logo = makeDemoLogo();
+    state.logo.onload = render;
+  };
   pen.src = 'pen.png';
 })();
 </script>
