@@ -36,7 +36,7 @@
   </div>
 
   <div class="controls">
-    <label>Größe <input type="range" id="pp-size" min="20" max="400" value="150"></label>
+    <label>Größe <input type="range" id="pp-size" min="20" max="400" value="230"></label>
     <label>Stift drehen <input type="range" id="pp-phi" min="-180" max="180" value="0"></label>
     <label>Logo drehen <input type="range" id="pp-rot" min="-180" max="180" value="0"></label>
     <label>Darstellung
@@ -67,7 +67,7 @@
 
   const state = {
     u0: uOf(300, 455), psi0: 0,      // Logo-Mitte: Achsposition / Winkel auf dem Zylinder
-    size: 150, rot: 0, phi: 0,       // Größe, Logo-Drehung (Grad), Stiftdrehung (Grad)
+    size: 230, rot: 0, phi: 0,       // Größe, Logo-Drehung (Grad), Stiftdrehung (Grad)
     alpha: 0.9, mode: 'multiply', logo: null
   };
   const def = Object.assign({}, state);
